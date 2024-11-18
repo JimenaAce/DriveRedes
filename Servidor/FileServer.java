@@ -1,4 +1,6 @@
-import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.net.DatagramPacket;
 import java.net.DatagramSocket;
@@ -8,7 +10,6 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.util.Arrays;
 
 public class FileServer {
     private static final int PUERTO = 8000;
@@ -33,28 +34,27 @@ public class FileServer {
                         "Se recibió petición: " + mensaje + " desde: " + direccion + " en el puerto " + puertoCliente);
                 String[] peticionPartes = mensaje.split(":", 2);
                 String comando = peticionPartes[0];
-                String argumento = peticionPartes.length > 1 ? peticionPartes[1] : "";
+                String ruta = peticionPartes.length > 1 ? peticionPartes[1] : "";
                 mensaje = "";
                 // Acciones para cada comando
                 switch (comando) {
                     case "descargar":
-                        enviarArchivo(argumento, direccion, puertoCliente, socketUDP);
-                        continue;
+                        enviarArchivo(ruta, direccion, puertoCliente, socketUDP);
+                        break;
                     case "subir":
-                        // recibirArchivo(argumento, direccion, puertoCliente, socketUDP);
-                        // mensaje = "Archivo recibido: " + argumento;
+                        recibirArchivo(socketUDP);
                         break;
                     case "crearFolder":
-                        mensaje = crearFolder(argumento);
+                        mensaje = crearFolder(ruta);
                         break;
                     case "borrar":
-                        mensaje = borrar(argumento);
+                        mensaje = borrar(ruta);
                         break;
                     case "renombrar":
-                        mensaje = renombrar(argumento);
+                        mensaje = renombrar(ruta);
                         break;
                     case "listar":
-                        mensaje = listar(argumento);
+                        mensaje = listar(ruta);
                         break;
                     default:
                         mensaje = "Comando no reconocido: " + comando;
@@ -69,20 +69,6 @@ public class FileServer {
             }
         } catch (IOException e) {
             e.printStackTrace();
-        }
-    }
-
-    public static void enviarArchivo(String ruta, InetAddress direccion, int puertoCliente, DatagramSocket socketUDP)
-            throws IOException {
-        Path path = Paths.get(ruta);
-        String mensaje = "";
-        if (!Files.exists(path)) {
-            mensaje = "Error";
-            socketUDP.send(new DatagramPacket(mensaje.getBytes(), mensaje.getBytes().length, direccion, puertoCliente));
-            return;
-        } else {
-            mensaje = "Servidor enviando archivo...";
-            socketUDP.send(new DatagramPacket(mensaje.getBytes(), mensaje.getBytes().length, direccion, puertoCliente));
         }
     }
 
@@ -140,4 +126,125 @@ public class FileServer {
             return "Error al listar archivos: " + e.getMessage();
         }
     }
+
+    // Recibe un archivo fragmentado del cliente
+    /*
+     * public static void recibirArchivo(DatagramSocket socketUDP) throws
+     * IOException {
+     * byte[] buffer = new byte[1024];
+     * DatagramPacket peticion = new DatagramPacket(buffer, buffer.length);
+     * socketUDP.receive(peticion);
+     * String nombreArchivo = new String(peticion.getData()).trim();
+     * System.out.println(nombreArchivo);
+     * }
+     */
+
+    public static void recibirArchivo(DatagramSocket socketUDP) throws IOException {
+        byte[] buffer = new byte[TAMANO_FRAGMENTO];
+        DatagramPacket nombrePaquete = new DatagramPacket(buffer, buffer.length);
+        socketUDP.receive(nombrePaquete);
+        String nombreArchivo = new String(nombrePaquete.getData(), 0, nombrePaquete.getLength()).trim();
+        System.out.println(" --- Recibiendo archivo: " + nombreArchivo + " --- ");
+
+        FileOutputStream fos = new FileOutputStream(nombreArchivo);
+        int expectedSeqNum = 0;
+
+        while (true) {
+            DatagramPacket fragmentoPaquete = new DatagramPacket(buffer, buffer.length);
+            socketUDP.receive(fragmentoPaquete);
+            String fragmentoMensaje = new String(fragmentoPaquete.getData(), 0, fragmentoPaquete.getLength());
+
+            // Verificar si es el fin de la transmisión
+            if (fragmentoMensaje.equals("END")) {
+                System.out.println(" --- Transferencia completada --- ");
+                break;
+            }
+
+            // Extraer número de secuencia y datos
+            String[] partes = fragmentoMensaje.split(":", 2);
+            int seqNum = Integer.parseInt(partes[0]);
+            String datos = partes[1];
+
+            // Verificar el número de secuencia
+            if (seqNum == expectedSeqNum) {
+                // Escribir datos en el archivo
+                fos.write(datos.getBytes());
+                System.out.println("Fragmento " + seqNum + " recibido correctamente.");
+
+                // Enviar ACK
+                String ackMensaje = "ACK:" + seqNum;
+                DatagramPacket ackPaquete = new DatagramPacket(ackMensaje.getBytes(), ackMensaje.length(),
+                        fragmentoPaquete.getAddress(), fragmentoPaquete.getPort());
+                socketUDP.send(ackPaquete);
+
+                // Mover la ventana
+                expectedSeqNum++;
+            } else {
+                // Retransmitir el último ACK
+                String ackMensaje = "ACK:" + (expectedSeqNum - 1);
+                System.out.println(ackMensaje);
+                DatagramPacket ackPaquete = new DatagramPacket(ackMensaje.getBytes(), ackMensaje.length(),
+                        fragmentoPaquete.getAddress(), fragmentoPaquete.getPort());
+                socketUDP.send(ackPaquete);
+                System.out.println("Fragmento fuera de orden. Esperando " + expectedSeqNum);
+            }
+        }
+
+        fos.close();
+        System.out.println("Archivo " + nombreArchivo + " recibido exitosamente.");
+    }
+
+    // Envia un archivo fragmentado al cliente
+    public static void enviarArchivo(String nombreArchivo, InetAddress direccionCliente, int puertoCliente, DatagramSocket socketUDP) throws IOException {
+    File archivo = new File(nombreArchivo);
+    if (!archivo.exists()) {
+        System.out.println(" --- Error: No se encontró el archivo: " + nombreArchivo + " --- ");
+        String mensaje = "ERROR: Archivo no encontrado";
+        DatagramPacket errorPaquete = new DatagramPacket(mensaje.getBytes(), mensaje.length(), direccionCliente, puertoCliente);
+        socketUDP.send(errorPaquete);
+        return;
+    }
+
+    System.out.println(" --- Enviando archivo: " + nombreArchivo + " --- ");
+    FileInputStream fis = new FileInputStream(archivo);
+    byte[] buffer = new byte[TAMANO_FRAGMENTO];
+    int totalFragmentos = (int) Math.ceil((double) archivo.length() / TAMANO_FRAGMENTO);
+    int base = 0;
+    int nextSeqNum = 0;
+
+    while (base < totalFragmentos) {
+        // Enviar fragmentos dentro de la ventana
+        while (nextSeqNum < base + TAMANO_VENTANA && nextSeqNum < totalFragmentos) {
+            int bytesLeidos = fis.read(buffer);
+            String fragmento = nextSeqNum + ":" + new String(buffer, 0, bytesLeidos);
+            DatagramPacket fragmentoPaquete = new DatagramPacket(fragmento.getBytes(), fragmento.length(), direccionCliente, puertoCliente);
+            socketUDP.send(fragmentoPaquete);
+            System.out.println("Enviado fragmento " + nextSeqNum);
+            nextSeqNum++;
+        }
+
+        // Esperar ACK del cliente
+        byte[] ackBuffer = new byte[1024];
+        DatagramPacket ackPaquete = new DatagramPacket(ackBuffer, ackBuffer.length);
+        try {
+            socketUDP.setSoTimeout(1000);
+            socketUDP.receive(ackPaquete);
+            String ackMensaje = new String(ackPaquete.getData(), 0, ackPaquete.getLength());
+            int ackNum = Integer.parseInt(ackMensaje.split(":")[1]);
+            System.out.println("ACK recibido para fragmento " + ackNum);
+            base = ackNum + 1;
+        } catch (SocketTimeoutException e) {
+            System.out.println("Timeout alcanzado. Retransmitiendo desde el fragmento " + base);
+            nextSeqNum = base;
+        }
+    }
+
+    // Enviar mensaje de fin de archivo
+    String finMensaje = "END";
+    DatagramPacket finPaquete = new DatagramPacket(finMensaje.getBytes(), finMensaje.length(), direccionCliente, puertoCliente);
+    socketUDP.send(finPaquete);
+    System.out.println(" --- Archivo enviado exitosamente --- ");
+    fis.close();
+}
+
 }
